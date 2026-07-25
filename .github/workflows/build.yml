@@ -23,6 +23,9 @@ jobs:
         with:
           channel: 'stable'
 
+      - name: Eksik Android Dosyalarını Oluştur
+        run: flutter create .
+
       - name: Get Dependencies
         run: flutter pub get
 
