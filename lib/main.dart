@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'dart:math';
 
 List<CameraDescription> cameras = [];
 
@@ -17,36 +18,38 @@ class SerbestDusmeApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark(),
-      home: const KameraTakipSayfasi(),
+      home: const OtomatikDusmeSayfasi(),
     );
   }
 }
 
-class KameraTakipSayfasi extends StatefulWidget {
-  const KameraTakipSayfasi({super.key});
+class OtomatikDusmeSayfasi extends StatefulWidget {
+  const OtomatikDusmeSayfasi({super.key});
 
   @override
-  State<KameraTakipSayfasi> createState() => _KameraTakipSayfasiState();
+  State<OtomatikDusmeSayfasi> createState() => _OtomatikDusmeSayfasiState();
 }
 
-class _KameraTakipSayfasiState extends State<KameraTakipSayfasi> {
+class _OtomatikDusmeSayfasiState extends State<OtomatikDusmeSayfasi> {
   CameraController? controller;
   Rect? selectedBox;
   Offset? startPoint;
   
-  bool isTracking = false;
-  bool isProcessing = false;
-  bool timerStarted = false;
+  bool isReadyToDetect = false;
+  bool isRunning = false;
+  bool isFinished = false;
   
   Stopwatch stopwatch = Stopwatch();
-  double? elapsedTime;
-  int? referenceLuma; // Cismin ilk kilitlendiği anki ışık/renk değeri
+  double? finalTime;
+  double? calculatedHeight;
+  double? calculatedVelocity;
+  
+  int? baselineTopLuma;
 
   @override
   void initState() {
     super.initState();
     if (cameras.isNotEmpty) {
-      // Görüntü işlemenin telefonu kitlememesi için Medium çözünürlük
       controller = CameraController(cameras[0], ResolutionPreset.medium);
       controller!.initialize().then((_) {
         if (!mounted) return;
@@ -55,76 +58,89 @@ class _KameraTakipSayfasiState extends State<KameraTakipSayfasi> {
     }
   }
 
-  void _startVisionProcessing() {
+  void _startCameraAnalysis() {
     if (controller == null || !controller!.value.isInitialized) return;
     
     stopwatch.reset();
-    timerStarted = false;
-    referenceLuma = null;
+    isRunning = false;
+    isFinished = false;
+    finalTime = null;
+    baselineTopLuma = null;
 
-    // Kameradan saniyede 30 kare (frame) okumaya başlıyoruz
     controller!.startImageStream((CameraImage image) {
-      if (!isTracking || isProcessing || timerStarted) return;
-      isProcessing = true;
+      if (!isReadyToDetect || isFinished) return;
 
       try {
         if (image.format.group == ImageFormatGroup.yuv420) {
-          final bytes = image.planes[0].bytes; 
-          
-          int sampleSum = 0;
-          int sampleCount = 0;
-          
-          // Sensör algılaması: Görüntünün merkez piksellerinin renk/ışık ortalamasını alıyoruz
-          int startIdx = (bytes.length ~/ 2) - 1000;
-          for (int i = startIdx; i < startIdx + 2000; i += 2) {
-            if (i > 0 && i < bytes.length) {
-              sampleSum += bytes[i];
-              sampleCount++;
-            }
-          }
-          
-          int currentLuma = sampleCount > 0 ? (sampleSum ~/ sampleCount) : 0;
+          final bytes = image.planes[0].bytes;
+          int width = image.width;
+          int height = image.height;
 
-          if (referenceLuma == null) {
-            // Cisim ilk çizildiğinde pikselleri hafızaya kaydet
-            referenceLuma = currentLuma;
-          } else {
-            // Cisim aşağı kaydığında pikseller (ışık) referanstan sapar
-            int difference = (currentLuma - referenceLuma!).abs();
-            if (difference > 12) { // Hassasiyet eşiği: Cisim hareket etti!
-              stopwatch.start();
-              setState(() {
-                timerStarted = true;
-              });
-              // Süre başladığında telefonu rahatlatmak için arka plan analizini durdur
-              controller!.stopImageStream();
+          // Çizilen kutunun içindeki piksel/ışık değişimini analiz et
+          if (selectedBox != null) {
+            int boxX = (selectedBox!.left * width / MediaQuery.of(context).size.width).clamp(0, width - 10).toInt();
+            int boxY = (selectedBox!.top * height / MediaQuery.of(context).size.height).clamp(0, height - 10).toInt();
+            int boxW = (selectedBox!.width * width / MediaQuery.of(context).size.width).clamp(10, width - boxX).toInt();
+            int boxH = (selectedBox!.height * height / MediaQuery.of(context).size.height).clamp(10, height - boxY).toInt();
+
+            int sum = 0;
+            int count = 0;
+            for (int y = boxY; y < boxY + boxH; y += 4) {
+              for (int x = boxX; x < boxX + boxW; x += 4) {
+                int index = y * width + x;
+                if (index < bytes.length) {
+                  sum += bytes[index];
+                  count++;
+                }
+              }
+            }
+
+            int currentLuma = count > 0 ? (sum ~/ count) : 0;
+
+            if (baselineTopLuma == null) {
+              baselineTopLuma = currentLuma;
+            } else if (!isRunning) {
+              int diff = (currentLuma - baselineTopLuma!).abs();
+              if (diff > 15) { // Cisim bırakıldığı an hareket algılandı!
+                stopwatch.start();
+                setState(() {
+                  isRunning = true;
+                });
+                controller!.stopImageStream(); // İşlemciyi yormamak için akışı durdur
+              }
             }
           }
         }
       } catch (e) {
-        // Olası kamera okuma hatalarını yut
-      } finally {
-        isProcessing = false;
+        // Hata yönetimi
       }
     });
   }
 
-  void _stopTimer() {
+  void _stopTimerManually() {
     if (stopwatch.isRunning) {
       stopwatch.stop();
+      double t = stopwatch.elapsedMicroseconds / 1000000.0;
+      double g = 9.81;
       setState(() {
-        elapsedTime = stopwatch.elapsedMilliseconds / 1000.0;
-        isTracking = false;
+        finalTime = t;
+        calculatedHeight = 0.5 * g * pow(t, 2).toDouble();
+        calculatedVelocity = g * t;
+        isFinished = true;
+        isReadyToDetect = false;
       });
+      if (controller?.value.isStreamingImages == true) {
+        controller!.stopImageStream();
+      }
     }
   }
 
   @override
   void dispose() {
     if (controller?.value.isStreamingImages == true) {
-      controller?.stopImageStream();
+      controller!.stopImageStream();
     }
-    controller?.dispose();
+    controller!.dispose();
     super.dispose();
   }
 
@@ -136,20 +152,24 @@ class _KameraTakipSayfasiState extends State<KameraTakipSayfasi> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Sensörlü Düşme Tespiti'),
+        title: const Text('Akıllı Serbest Düşme Lab'),
+        centerTitle: true,
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'Sıfırla',
             onPressed: () {
               if (controller?.value.isStreamingImages == true) {
-                controller?.stopImageStream();
+                controller!.stopImageStream();
               }
               setState(() {
                 selectedBox = null;
-                isTracking = false;
-                timerStarted = false;
-                elapsedTime = null;
+                isReadyToDetect = false;
+                isRunning = false;
+                isFinished = false;
+                finalTime = null;
+                calculatedHeight = null;
+                calculatedVelocity = null;
                 stopwatch.reset();
               });
             },
@@ -160,13 +180,16 @@ class _KameraTakipSayfasiState extends State<KameraTakipSayfasi> {
         children: [
           GestureDetector(
             onPanStart: (details) {
+              if (isFinished) return;
               setState(() {
                 startPoint = details.localPosition;
                 selectedBox = Rect.fromPoints(startPoint!, startPoint!);
-                isTracking = false;
+                isReadyToDetect = false;
+                isRunning = false;
               });
             },
             onPanUpdate: (details) {
+              if (isFinished) return;
               setState(() {
                 if (startPoint != null) {
                   selectedBox = Rect.fromPoints(startPoint!, details.localPosition);
@@ -174,36 +197,44 @@ class _KameraTakipSayfasiState extends State<KameraTakipSayfasi> {
               });
             },
             onPanEnd: (details) {
-              setState(() {
-                isTracking = true;
-              });
-              // Kutu çizimi bittiğinde görüntü işlemeyi başlat
-              _startVisionProcessing();
+              if (selectedBox != null) {
+                setState(() {
+                  isReadyToDetect = true;
+                });
+                _startCameraAnalysis();
+              }
             },
             child: CameraPreview(controller!),
           ),
-          
+
           if (selectedBox != null)
             Positioned.fromRect(
               rect: selectedBox!,
               child: Container(
                 decoration: BoxDecoration(
                   border: Border.all(
-                    color: timerStarted ? Colors.transparent : (isTracking ? Colors.green : Colors.red),
+                    color: isRunning ? Colors.amber : (isReadyToDetect ? Colors.green : Colors.red),
                     width: 3,
                   ),
-                  color: timerStarted ? Colors.transparent : Colors.red.withOpacity(0.2),
+                  color: isRunning ? Colors.amber.withOpacity(0.3) : Colors.green.withOpacity(0.2),
+                ),
+                child: Center(
+                  child: Text(
+                    isRunning ? 'DÜŞÜYOR...' : (isReadyToDetect ? 'KİLİTLENDİ' : 'ÇİZİLİYOR'),
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                  ),
                 ),
               ),
             ),
-            
+
           Positioned(
-            bottom: 20,
+            bottom: 25,
             left: 20,
             right: 20,
             child: Card(
               color: Colors.black87,
-              elevation: 8,
+              elevation: 10,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
               child: Padding(
                 padding: const EdgeInsets.all(20.0),
                 child: Column(
@@ -211,40 +242,59 @@ class _KameraTakipSayfasiState extends State<KameraTakipSayfasi> {
                   children: [
                     Text(
                       selectedBox == null
-                          ? 'Cismin etrafına parmağınızla kutu çizin.'
-                          : (timerStarted 
-                              ? 'DÜŞÜŞ ALGILANDI! KRONOMETRE ÇALIŞIYOR...' 
-                              : 'Cisim kilitlendi. Düşmesi bekleniyor...'),
+                          ? '1. Adım: Cismi tuttuğunuz başlangıç yerine kutu çizin.'
+                          : (isRunning
+                              ? 'Kronometre çalışıyor! Yere çarpınca durdurun.'
+                              : (isReadyToDetect
+                                  ? 'Cisim kilitlendi! Şimdi serbest bırakın.'
+                                  : 'Kutuyu çizmeyi tamamlayın.')),
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        fontSize: 16, 
-                        fontWeight: timerStarted ? FontWeight.bold : FontWeight.normal,
-                        color: timerStarted ? Colors.amberAccent : Colors.white
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: isRunning ? Colors.amberAccent : Colors.white,
                       ),
                     ),
-                    if (timerStarted && elapsedTime == null) ...[
-                      const SizedBox(height: 20),
+                    
+                    if (isRunning && !isFinished) ...[
+                      const SizedBox(height: 15),
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.red,
-                          minimumSize: const Size(double.infinity, 70),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))
+                          minimumSize: const Size(double.infinity, 60),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         ),
-                        onPressed: _stopTimer,
-                        child: const Text('YERE ÇARPTI (DURDUR)', 
-                          style: TextStyle(fontSize: 22, color: Colors.white, fontWeight: FontWeight.bold)
+                        onPressed: _stopTimerManually,
+                        child: const Text(
+                          'YERE ÇARPTI (DURDUR)',
+                          style: TextStyle(fontSize: 20, color: Colors.white, fontWeight: FontWeight.bold),
                         ),
                       ),
                     ],
-                    if (elapsedTime != null) ...[
+
+                    if (finalTime != null) ...[
                       const SizedBox(height: 15),
                       const Divider(color: Colors.grey),
-                      const SizedBox(height: 5),
+                      const SizedBox(height: 10),
                       Text(
-                        'Ölçülen Süre (t): ${elapsedTime!.toStringAsFixed(3)} saniye',
-                        style: const TextStyle(fontSize: 20, color: Colors.greenAccent, fontWeight: FontWeight.bold),
+                        'Geçen Süre (t): ${finalTime!.toStringAsFixed(3)} s',
+                        style: const TextStyle(fontSize: 22, color: Colors.greenAccent, fontWeight: FontWeight.bold),
                       ),
-                    ]
+                      const SizedBox(height: 8),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          Text(
+                            'Yükseklik: ${calculatedHeight!.toStringAsFixed(2)} m',
+                            style: const TextStyle(fontSize: 16, color: Colors.lightBlueAccent),
+                          ),
+                          Text(
+                            'Çarpma Hızı: ${calculatedVelocity!.toStringAsFixed(2)} m/s',
+                            style: const TextStyle(fontSize: 16, color: Colors.orangeAccent),
+                          ),
+                        ],
+                      ),
+                    ],
                   ],
                 ),
               ),
